@@ -1,0 +1,149 @@
+version: '3.8'
+
+services:
+  # ----------------------------------------------------------------------
+  # 1. Apache Kafka in KRaft Mode (No ZooKeeper, Low JVM Memory Footprint)
+  # ----------------------------------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: fraud-kafka
+    restart: unless-stopped
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:29093'
+      KAFKA_LISTENERS: 'PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+      # Memory Optimization: KRaft without ZooKeeper capped to 512m
+      KAFKA_JVM_PERFORMANCE_OPTS: '-Xmx512m -Xms512m'
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+
+  # Automated topic creation for raw-transactions (3 partitions for parallel Spark consumption)
+  init-kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: fraud-init-kafka
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: [ "bash", "-c" ]
+    command: |
+      "
+      echo 'Waiting for Kafka to be ready...'
+      kafka-topics --bootstrap-server kafka:29092 --list
+      echo 'Creating raw-transactions topic with 3 partitions...'
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic raw-transactions --replication-factor 1 --partitions 3
+      echo 'Topic raw-transactions created successfully:'
+      kafka-topics --bootstrap-server kafka:29092 --describe --topic raw-transactions
+      "
+
+  # ----------------------------------------------------------------------
+  # 2. Redis Cache (In-Memory Feature Store)
+  # ----------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: fraud-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --save "" --appendonly no --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ----------------------------------------------------------------------
+  # 3. PostgreSQL 15 (Relational Audit Store & Transaction Ledger)
+  # ----------------------------------------------------------------------
+  postgres:
+    image: postgres:15-alpine
+    container_name: fraud-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: fraud_db
+      POSTGRES_USER: fraud_user
+      POSTGRES_PASSWORD: fraud_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fraud_user -d fraud_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ----------------------------------------------------------------------
+  # 4. Django REST Framework Scoring Service
+  # ----------------------------------------------------------------------
+  django-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.django
+    container_name: fraud-django-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=fraud_db
+      - DB_USER=fraud_user
+      - DB_PASSWORD=fraud_password
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - DJANGO_SETTINGS_MODULE=fraud_service.settings
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  # ----------------------------------------------------------------------
+  # 5. PySpark Structured Streaming Ingestion Worker
+  # ----------------------------------------------------------------------
+  spark-streaming:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    container_name: fraud-spark-streaming
+    restart: unless-stopped
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      # Durable storage volume mount (never /tmp)
+      - CHECKPOINT_LOCATION=/data/spark-checkpoints/fraud-scoring
+    volumes:
+      - spark_checkpoints:/data/spark-checkpoints
+    depends_on:
+      init-kafka:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+    driver: local
+  spark_checkpoints:
+    driver: local
+

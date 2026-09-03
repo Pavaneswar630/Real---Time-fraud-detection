@@ -1,0 +1,16 @@
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Install Java (required for PySpark execution)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    default-jre-headless \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install PySpark, Redis client, and requests
+RUN pip install --no-cache-dir pyspark==3.5.0 redis requests
+
+COPY spark_ingestion.py .
+
+CMD ["python", "spark_ingestion.py"]

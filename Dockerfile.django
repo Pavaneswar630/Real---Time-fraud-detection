@@ -1,0 +1,30 @@
+FROM python:3.10-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    DEBIAN_FRONTEND=noninteractive
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install TensorFlow in container
+RUN pip install --no-cache-dir tensorflow-cpu==2.15.0
+
+COPY . /app/
+
+WORKDIR /app/fraud_service
+
+# Generate placeholder model if not already present
+RUN python scoring/ml/generate_model.py || true
+
+EXPOSE 8000
+
+CMD ["sh", "-c", "python manage.py migrate && gunicorn fraud_service.wsgi:application --bind 0.0.0.0:8000 --workers 4 --threads 2 --timeout 60"]
