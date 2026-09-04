@@ -15,10 +15,12 @@ Implements the high-performance /score POST endpoint with:
 import os
 import time
 import logging
+import json
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from typing import Dict, Any, Optional, Tuple
 
+from django.apps import apps as django_apps
 from django.conf import settings
 from django.db import close_old_connections, IntegrityError
 from rest_framework.views import APIView
@@ -205,6 +207,51 @@ def enqueue_audit_record(record: Dict[str, Any]) -> None:
         )
 
 
+def _log_phase_timing(transaction_id: str, phase: str, started_at: float) -> None:
+    logger.info(json.dumps({
+        "event": "scoring_phase_timing",
+        "transaction_id": transaction_id,
+        "phase": phase,
+        "duration_ms": round((time.perf_counter() - started_at) * 1000.0, 3),
+    }, separators=(",", ":")))
+
+
+from gevent.threadpool import ThreadPool
+
+# Dedicated thread pool sized to your CPU cores for CPU-bound TF inference
+_tf_inference_pool = ThreadPool(4)
+
+def _infer_probability(transaction_id: str, amount: float, txn_count_15m: int,
+                       staleness_seconds: float) -> float:
+    """Run TensorFlow inference asynchronously via a background thread pool to prevent gevent event-loop blocking."""
+    started_at = time.perf_counter()
+    app_config = django_apps.get_app_config("scoring")
+    
+    if app_config.infer_fn is not None:
+        import tensorflow as tf
+
+        input_tensor = tf.constant(
+            [[amount, txn_count_15m, staleness_seconds]],
+            dtype=tf.float32,
+        )
+        
+        # Offload native C++ blocking execution to an OS thread so gevent's event loop stays responsive
+        def _run_tensor_inference():
+            prediction = app_config.infer_fn(input_tensor)
+            return float(prediction[0][0].numpy())
+            
+        probability = _tf_inference_pool.spawn(_run_tensor_inference).get()
+    else:
+        engine = get_model()
+        probability, _ = engine.predict(
+            amount=amount,
+            txn_count_15m=txn_count_15m,
+            staleness_seconds=staleness_seconds,
+        )
+        
+    _log_phase_timing(transaction_id, "tensorflow_inference", started_at)
+    return float(probability)
+
 def get_redis():
     """Retrieve or initialize pooled Redis connection."""
     global _redis_client
@@ -254,6 +301,7 @@ class ScoreTransactionView(APIView):
         amount = float(data["amount"])
 
         # 2. Redis Feature Retrieval Protected by Circuit Breaker
+        redis_started_at = time.perf_counter()
         raw_features = None
         infra_error = False
 
@@ -271,6 +319,7 @@ class ScoreTransactionView(APIView):
                 redis_circuit_breaker.record_failure()
                 logger.error(f"Redis feature store connection failed: {e}. Circuit failure recorded.")
                 infra_error = True
+        _log_phase_timing(transaction_id, "redis_lookup", redis_started_at)
 
         # 3. Feature Evaluation & Staleness Check
         now_ts = time.time()
@@ -316,8 +365,8 @@ class ScoreTransactionView(APIView):
             else:
                 # Fresh real-time features available: Execute TensorFlow Model
                 mode = "REAL_TIME"
-                engine = get_model()
-                fraud_probability, _ = engine.predict(
+                fraud_probability = _infer_probability(
+                    transaction_id,
                     amount=amount,
                     txn_count_15m=txn_count_15m,
                     staleness_seconds=staleness_seconds
@@ -337,8 +386,8 @@ class ScoreTransactionView(APIView):
             staleness_seconds = None
             features_dict = {"txn_count_15m": 0, "total_amount_15m": 0.0}
             
-            engine = get_model()
-            fraud_probability, _ = engine.predict(
+            fraud_probability = _infer_probability(
+                transaction_id,
                 amount=amount,
                 txn_count_15m=0,
                 staleness_seconds=0.0
@@ -355,6 +404,7 @@ class ScoreTransactionView(APIView):
         # 4. Queue PostgreSQL audit persistence; never wait on the database here.
         engine = get_model()
         model_version = getattr(engine, "version", "v1.0.0")
+        audit_started_at = time.perf_counter()
         enqueue_audit_record({
             "transaction_id": transaction_id,
             "user_id": user_id,
@@ -366,6 +416,7 @@ class ScoreTransactionView(APIView):
             "features_snapshot": features_dict,
             "model_version": model_version,
         })
+        _log_phase_timing(transaction_id, "postgres_audit_dispatch", audit_started_at)
 
         # 5. Record Observability Telemetry
         total_latency_ms = (time.time() - start_time) * 1000.0
