@@ -39,7 +39,7 @@ flowchart LR
     C[Client / hey / wrk / benchmark_load.py] --> G[Gunicorn gevent workers]
     G --> V[Django scoring endpoint]
     V -->|pooled HGETALL| R
-    V -->|fixed [None, 3] tensor| T[Warm TensorFlow infer_fn]
+    V -->|fixed three-feature tensor| T[Warm TensorFlow infer_fn]
     T --> V
     V -->|background dispatch| Q[gevent ThreadPool]
     Q --> P[(PostgreSQL audit ledger)]
@@ -61,7 +61,7 @@ gunicorn fraud_service.wsgi:application \
 
 ### State And Caching
 
-Redis stores rolling per-user features such as transaction velocity, recent aggregate amount, and the timestamp of the latest update. Django uses a shared Redis connection pool with `max_connections=300`, one-second socket and connect timeouts, and a stateful circuit breaker. When Redis is unavailable or features are too stale, the endpoint routes the transaction to `MANUAL_REVIEW` instead of silently approving it.
+Redis stores rolling per-user features such as transaction velocity, recent aggregate amount, and the timestamp of the latest update. Each Django worker uses its own Redis connection pool with `max_connections=300`, one-second socket and connect timeouts, and a stateful circuit breaker. When Redis is unavailable or features are too stale, the endpoint routes the transaction to `MANUAL_REVIEW` instead of silently approving it.
 
 ### Inference Engine
 
@@ -171,7 +171,7 @@ The service exposes Prometheus instrumentation for:
 
 ### Structured Phase Timing Logs
 
-Each request emits JSON timing records with an event name, transaction ID, phase, and duration in milliseconds:
+The normal scoring path emits JSON timing records with an event name, transaction ID, phase, and duration in milliseconds. Redis lookup and audit dispatch are recorded for every validated request; TensorFlow timing is recorded when inference runs:
 
 ```json
 {"event":"scoring_phase_timing","transaction_id":"txn-123","phase":"redis_lookup","duration_ms":0.742}
