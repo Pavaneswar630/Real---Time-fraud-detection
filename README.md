@@ -7,12 +7,18 @@ A distributed streaming proof-of-concept demonstrating transaction fraud evaluat
 ## 1. System Topology
 
 ```mermaid
-flowchart TD
-    subgraph Ingestion ["Ingestion & Streaming Aggregation"]
-        K[Kafka KRaft:9092<br/>Topic: raw-transactions<br/>3 Partitions] -->|Structured Streaming<br/>Trigger: 5s| S[PySpark 3.5.0 Worker]
-        CP[(Durable Checkpoint Volume<br/>WAL Offset Store)] <--> S
-        S -->|ForeachBatch<br/>Monotonic Window HSET| R[(Redis 7 Alpine:6379<br/>user:id:features)]
+fgraph TD
+    Client -->|HTTP Request| Gunicorn[Gunicorn / Gevent Workers]
+    Gunicorn -->|WSGI / Concurrency| Django[Django API View]
+    
+    subgraph Core Pipeline
+        Django -->|Feature Store Lookup| Redis[(Redis Cache)]
+        Django -->|Async ThreadPool| TF["TensorFlow Engine (@tf.function)"]
+        TF -->|Fast Inference (1.2ms)| Django
     end
+    
+    Django -->|Asynchronous Audit Dispatch| PG[(PostgreSQL)]
+    Django -->|JSON Response (256 req/sec)| Client
 
     subgraph Serving ["Inference & Scoring Service"]
         Client[Client / JMeter 500 Threads] -->|POST /score<br/>Rate-Limited: 1,200 req/s| D[Django REST Framework]
