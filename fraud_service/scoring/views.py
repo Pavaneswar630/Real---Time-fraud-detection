@@ -15,11 +15,12 @@ Implements the high-performance /score POST endpoint with:
 import os
 import time
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from typing import Dict, Any, Optional, Tuple
 
 from django.conf import settings
-from django.db import IntegrityError
+from django.db import close_old_connections, IntegrityError
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -174,6 +175,34 @@ from scoring.throttles import CapacityPlannedRateThrottle, HighThroughputRateThr
 
 # Lazy global Redis client pool
 _redis_client = None
+_audit_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="fraud-audit")
+
+
+def _persist_audit_record(record: Dict[str, Any]) -> None:
+    """Persist an audit record outside the request thread."""
+    close_old_connections()
+    try:
+        ScoredTransaction.objects.create(**record)
+        db_circuit_breaker.record_success()
+    except IntegrityError:
+        # Another request may have queued the same transaction first.
+        logger.info("Audit record already exists for %s", record["transaction_id"])
+    except Exception:
+        db_circuit_breaker.record_failure()
+        logger.exception("PostgreSQL audit write failed for %s", record["transaction_id"])
+    finally:
+        close_old_connections()
+
+
+def enqueue_audit_record(record: Dict[str, Any]) -> None:
+    """Queue audit persistence so PostgreSQL latency does not delay scoring."""
+    if db_circuit_breaker.allow_request():
+        _audit_executor.submit(_persist_audit_record, record)
+    else:
+        logger.warning(
+            "PostgreSQL CircuitBreaker is OPEN. Skipping audit write for %s.",
+            record["transaction_id"],
+        )
 
 
 def get_redis():
@@ -189,7 +218,7 @@ def get_redis():
             db=0,
             socket_timeout=1.0,
             socket_connect_timeout=1.0,
-            max_connections=50
+            max_connections=300
         )
         _redis_client = redis.Redis(connection_pool=pool)
     return _redis_client
@@ -224,35 +253,7 @@ class ScoreTransactionView(APIView):
         user_id = data["user_id"]
         amount = float(data["amount"])
 
-        # 2. Idempotency Check
-        # Check if transaction was already scored to prevent duplicate billing/auditing
-        if db_circuit_breaker.allow_request():
-            try:
-                existing_record = ScoredTransaction.objects.filter(transaction_id=transaction_id).first()
-                db_circuit_breaker.record_success()
-                if existing_record:
-                    IDEMPOTENT_REPLAY_COUNTER.inc()
-                    total_latency = (time.time() - start_time) * 1000.0
-                    return Response({
-                        "transaction_id": existing_record.transaction_id,
-                        "user_id": existing_record.user_id,
-                        "fraud_probability": existing_record.fraud_probability,
-                        "decision": existing_record.decision,
-                        "mode": existing_record.mode,
-                        "staleness_seconds": existing_record.staleness_seconds,
-                        "features": existing_record.features_snapshot,
-                        "model_version": existing_record.model_version,
-                        "latency_ms": round(total_latency, 2),
-                        "idempotent_replay": True
-                    }, status=status.HTTP_200_OK)
-            except Exception as e:
-                db_circuit_breaker.record_failure()
-                logger.warning(f"Idempotency DB lookup failed ({e}); proceeding with fresh evaluation.")
-        else:
-            logger.warning(f"Database CircuitBreaker is OPEN. Skipping idempotency lookup for {transaction_id}.")
-
-
-        # 3. Redis Feature Retrieval Protected by Circuit Breaker
+        # 2. Redis Feature Retrieval Protected by Circuit Breaker
         raw_features = None
         infra_error = False
 
@@ -271,7 +272,7 @@ class ScoreTransactionView(APIView):
                 logger.error(f"Redis feature store connection failed: {e}. Circuit failure recorded.")
                 infra_error = True
 
-        # 4. Feature Evaluation & Staleness Check
+        # 3. Feature Evaluation & Staleness Check
         now_ts = time.time()
         features_dict = {}
         staleness_seconds: Optional[float] = None
@@ -351,55 +352,29 @@ class ScoreTransactionView(APIView):
             else:
                 decision = "APPROVED"
 
-        # 5. Persist to PostgreSQL 15 Audit Ledger (Protected by DB Circuit Breaker)
+        # 4. Queue PostgreSQL audit persistence; never wait on the database here.
         engine = get_model()
         model_version = getattr(engine, "version", "v1.0.0")
-        
-        if db_circuit_breaker.allow_request():
-            try:
-                ScoredTransaction.objects.create(
-                    transaction_id=transaction_id,
-                    user_id=user_id,
-                    amount=Decimal(f"{amount:.2f}"),
-                    fraud_probability=fraud_probability,
-                    decision=decision,
-                    mode=mode,
-                    staleness_seconds=staleness_seconds,
-                    features_snapshot=features_dict,
-                    model_version=model_version
-                )
-                db_circuit_breaker.record_success()
-            except IntegrityError:
-                # Race condition on idempotency key: retrieve original winner
-                logger.info(f"Integrity duplicate detected for {transaction_id}. Returning winner record.")
-                winner = ScoredTransaction.objects.get(transaction_id=transaction_id)
-                total_latency = (time.time() - start_time) * 1000.0
-                return Response({
-                    "transaction_id": winner.transaction_id,
-                    "user_id": winner.user_id,
-                    "fraud_probability": winner.fraud_probability,
-                    "decision": winner.decision,
-                    "mode": winner.mode,
-                    "staleness_seconds": winner.staleness_seconds,
-                    "features": winner.features_snapshot,
-                    "model_version": winner.model_version,
-                    "latency_ms": round(total_latency, 2),
-                    "idempotent_replay": True
-                }, status=status.HTTP_200_OK)
-            except Exception as e:
-                db_circuit_breaker.record_failure()
-                logger.error(f"PostgreSQL audit write failed for {transaction_id}: {e}")
-        else:
-            logger.warning(f"PostgreSQL CircuitBreaker is OPEN. Skipping synchronous audit write for {transaction_id}.")
+        enqueue_audit_record({
+            "transaction_id": transaction_id,
+            "user_id": user_id,
+            "amount": Decimal(f"{amount:.2f}"),
+            "fraud_probability": fraud_probability,
+            "decision": decision,
+            "mode": mode,
+            "staleness_seconds": staleness_seconds,
+            "features_snapshot": features_dict,
+            "model_version": model_version,
+        })
 
-        # 6. Record Observability Telemetry
+        # 5. Record Observability Telemetry
         total_latency_ms = (time.time() - start_time) * 1000.0
         total_latency_sec = total_latency_ms / 1000.0
         
         REQUEST_COUNTER.labels(decision=decision, mode=mode).inc()
         LATENCY_HISTOGRAM.observe(total_latency_sec)
 
-        # 7. Standardized JSON Response
+        # 6. Standardized JSON Response
         response_data = {
             "transaction_id": transaction_id,
             "user_id": user_id,

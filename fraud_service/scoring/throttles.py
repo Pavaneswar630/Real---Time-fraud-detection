@@ -2,7 +2,7 @@
 Rate Throttling Policies
 ========================
 Capacity planning:
-  - 4 Gunicorn worker processes * 2 threads = 8 concurrent slots
+  - 4 Gunicorn gevent worker processes with cooperative concurrency
   - ~5ms average p50 request latency -> ~200 req/sec per slot
   - Peak server capacity: 8 * 200 = 1,600 req/sec
   - Ingress limit: 1,200 req/sec (72,000 req/min) providing 25% safety headroom

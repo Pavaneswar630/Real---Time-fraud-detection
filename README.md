@@ -16,10 +16,9 @@ flowchart TD
 
     subgraph Serving ["Inference & Scoring Service"]
         Client[Client / JMeter 500 Threads] -->|POST /score<br/>Rate-Limited: 1,200 req/s| D[Django REST Framework]
-        D -->|1. Idempotency Check| PG[(PostgreSQL 15 / SQLite<br/>ScoredTransaction)]
-        D -->|2. Sub-ms Feature Lookup<br/>Protected by Circuit Breaker| R
-        D -->|3. In-Memory Inference<br/>apps.py Singleton Model| M[TensorFlow / Neural Engine]
-        D -->|4. Audit Persistence| PG
+        D -->|1. Sub-ms Feature Lookup<br/>Protected by Circuit Breaker| R
+        D -->|2. In-Memory Inference<br/>apps.py Singleton Model| M[TensorFlow / Neural Engine]
+        D -.->|3. Background audit queue| PG[(PostgreSQL 15 / SQLite<br/>ScoredTransaction)]
         D -->|5. Telemetry| Prom[/metrics: Latency & State Gauges/]
     end
 
@@ -42,8 +41,9 @@ flowchart TD
 | **Redis TTL** | `900 seconds` (15 min) | Exactly matches the 15-minute rolling window duration. If an account has no transactions for 15 minutes, its feature vector naturally decays to zero and Redis auto-evicts the key, preventing memory leaks. |
 | **Staleness Threshold** | `60 seconds` | Streaming pipeline SLA. PySpark micro-batches commit every 5s. Stale Redis features (>60s) indicate stream delay, consumer lag, or broker disconnect. Serving stale data silently as "real-time" causes false negative clearances; routing to `DEGRADED_STALE` / `MANUAL_REVIEW` protects payment integrity. |
 | **Stateful Circuit Breaker** | Closed / Open / Half-Open | A state machine protects Redis and DB from cascading overload. After 5 consecutive connection failures, the circuit trips to `OPEN` for a 30s cooldown, short-circuiting downstream calls instantly rather than waiting on socket timeouts. |
-| **Rate Limiting** | `1,200 req/s` (72k/min) | **Capacity Planning Math:** 4 Gunicorn workers x 2 threads = 8 concurrent execution slots. With average p50 latency of ~5ms, each slot can sustain ~200 req/sec (1,600 req/s theoretical max). Sizing to 1,200 req/s reserves a 25% safety headroom for GC pauses and lock contention. Breaches return HTTP 429 with RFC 6585 `Retry-After: 1`. |
-| **Idempotency** | Unique `transaction_id` | Enforced at the API and database levels. Retried transactions return the cached decision with `idempotent_replay: true` without duplicate billing or audit corruption. |
+| **Rate Limiting** | `1,200 req/s` (72k/min) | Gunicorn runs 4 `gevent` workers with cooperative concurrency; `--worker-connections 1000` provides headroom for 500+ concurrent clients. Breaches return HTTP 429 with RFC 6585 `Retry-After: 1`. |
+| **Audit Persistence** | Background thread pool | The response path performs Redis feature retrieval and in-memory inference, then queues `ScoredTransaction` persistence. The unique database constraint makes concurrent duplicate audit jobs harmless. |
+| **Idempotency** | Unique `transaction_id` | The database constraint prevents duplicate ledger rows. Because the response path does not block on PostgreSQL, immediate retries are scored again and the later audit job is discarded as a duplicate. |
 
 ---
 
