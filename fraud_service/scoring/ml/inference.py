@@ -56,7 +56,11 @@ class FraudInferenceEngine:
         if self.model is not None and self.backend.startswith("tensorflow"):
             import numpy as np
             input_tensor = np.array([[float(amount), float(txn_count_15m), float(staleness_seconds)]], dtype=np.float32)
-            raw_pred = self.model.predict(input_tensor, verbose=0)
+            # Replace this line:
+            # raw_pred = self.model.predict(input_tensor, verbose=0)
+            # With this direct functional call:
+            preds = self.model(input_tensor, training=False)
+            raw_pred = preds.numpy() if hasattr(preds, 'numpy') else preds
             probability = float(raw_pred[0][0])
         else:
             # High-fidelity deterministic sigmoid risk calculation

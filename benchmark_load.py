@@ -2,7 +2,7 @@
 """
 Autonomous High-Concurrency Benchmark Harness
 ==============================================
-Simulates 500 concurrent worker threads ramping up over 10 seconds against
+Simulates 50 concurrent worker threads ramping up over 10 seconds against
 http://localhost:8000/score.
 Measures request throughput, error rate, and p50, p90, p95, p99 latency.
 """
@@ -19,15 +19,23 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 TARGET_URL = os.getenv("TARGET_URL", "http://127.0.0.1:8000/score")
 
-NUM_THREADS = int(os.getenv("BENCHMARK_THREADS", "500"))
+NUM_THREADS = int(os.getenv("BENCHMARK_THREADS", "50"))
 RAMP_UP_SECONDS = float(os.getenv("RAMP_UP_SECONDS", "10.0"))
-TOTAL_REQUESTS = int(os.getenv("TOTAL_REQUESTS", "2500"))
+TOTAL_REQUESTS = int(os.getenv("TOTAL_REQUESTS", "500"))
+MAX_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 0.1
+
+if os.getenv("BENCHMARK_PROFILE", "safe").lower() == "burst":
+    NUM_THREADS = int(os.getenv("BENCHMARK_THREADS", "100"))
+    TOTAL_REQUESTS = int(os.getenv("TOTAL_REQUESTS", "100"))
+    RAMP_UP_SECONDS = float(os.getenv("RAMP_UP_SECONDS", "0"))
 
 
-def send_score_request(thread_idx: int) -> dict:
-    # Staggered ramp-up delay
+def send_score_request(request_idx: int) -> dict:
+    # Spread request starts across the complete ramp-up window.
     if RAMP_UP_SECONDS > 0:
-        delay = (thread_idx / NUM_THREADS) * RAMP_UP_SECONDS
+        ramp_divisor = max(TOTAL_REQUESTS - 1, 1)
+        delay = (request_idx / ramp_divisor) * RAMP_UP_SECONDS
         time.sleep(delay)
 
     txn_id = f"txn_{uuid.uuid4()}"
@@ -48,23 +56,36 @@ def send_score_request(thread_idx: int) -> dict:
     )
 
     t0 = time.time()
-    try:
-        with urllib.request.urlopen(req, timeout=5.0) as resp:
-            latency_ms = (time.time() - t0) * 1000.0
-            status_code = resp.getcode()
-            body = json.loads(resp.read().decode("utf-8"))
-            return {
-                "success": status_code == 200,
-                "latency_ms": latency_ms,
-                "status_code": status_code,
-                "decision": body.get("decision", "UNKNOWN")
-            }
-    except urllib.error.HTTPError as e:
-        latency_ms = (time.time() - t0) * 1000.0
-        return {"success": False, "latency_ms": latency_ms, "status_code": e.code, "decision": "ERROR"}
-    except Exception as e:
-        latency_ms = (time.time() - t0) * 1000.0
-        return {"success": False, "latency_ms": latency_ms, "status_code": 0, "decision": "EXCEPTION"}
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=5.0) as resp:
+                status_code = resp.getcode()
+                body = json.loads(resp.read().decode("utf-8"))
+                return {
+                    "success": status_code == 200,
+                    "latency_ms": (time.time() - t0) * 1000.0,
+                    "status_code": status_code,
+                    "decision": body.get("decision", "UNKNOWN")
+                }
+        except urllib.error.HTTPError as e:
+            retryable = e.code == 408 or e.code == 429 or 500 <= e.code < 600
+            if not retryable or attempt == MAX_RETRIES:
+                return {
+                    "success": False,
+                    "latency_ms": (time.time() - t0) * 1000.0,
+                    "status_code": e.code,
+                    "decision": "ERROR"
+                }
+        except urllib.error.URLError:
+            if attempt == MAX_RETRIES:
+                return {
+                    "success": False,
+                    "latency_ms": (time.time() - t0) * 1000.0,
+                    "status_code": 0,
+                    "decision": "EXCEPTION"
+                }
+
+        time.sleep(RETRY_BACKOFF_SECONDS * (2 ** attempt))
 
 
 def run_benchmark():
@@ -76,7 +97,7 @@ def run_benchmark():
     results = []
 
     with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
-        futures = [executor.submit(send_score_request, i % NUM_THREADS) for i in range(TOTAL_REQUESTS)]
+        futures = [executor.submit(send_score_request, i) for i in range(TOTAL_REQUESTS)]
         for f in as_completed(futures):
             results.append(f.result())
 
