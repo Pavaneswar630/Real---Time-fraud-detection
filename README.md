@@ -8,38 +8,24 @@ A distributed streaming proof-of-concept demonstrating transaction fraud evaluat
 
 ```mermaid
 graph TD
-    Client[Client / JMeter] -->|POST /score| D[Django REST Framework]
+    Client[Client / JMeter 500 Threads] -->|POST /score<br/>Rate-Limited: 1,200 req/s| D[Django REST Framework]
 
-    subgraph Core Pipeline & Resiliency ["High-Performance Fraud Scoring Architecture"]
-        D -->|1. Idempotency Check| PG[(PostgreSQL / SQLite)]
-        D -->|2. Feature Lookup w/ Circuit Breaker| R[(Redis Feature Store)]
-        D -->|3. In-Memory Thread-Safe Inference| M["TensorFlow Engine (@tf.function)"]
-        
-        %% Resiliency Branches
-        R -.->|Staleness > 60s| F1[Mode: DEGRADED_STALE<br/>Decision: MANUAL_REVIEW]
-        R -.->|Circuit OPEN After Failures| F2[Mode: INFRA_DEGRADED<br/>Decision: MANUAL_REVIEW]
-        PG -.->|Duplicate txn_id| F3[Return Cached Decision<br/>idempotent_replay: true]
-    end
-
-    M -->|Async ThreadPool Offload| D
-    D -->|Asynchronous Audit Dispatch| PG
-    D -->|Prometheus Telemetry| Prom[/metrics/g]
-    D -->|JSON Response (256 req/sec)| Client
     subgraph Serving ["Inference & Scoring Service"]
-        Client[Client / JMeter 500 Threads] -->|POST /score<br/>Rate-Limited: 1,200 req/s| D[Django REST Framework]
         D -->|1. Idempotency Check| PG[(PostgreSQL 15 / SQLite<br/>ScoredTransaction)]
-        D -->|2. Sub-ms Feature Lookup<br/>Protected by Circuit Breaker| R
-        D -->|3. In-Memory Inference<br/>apps.py Singleton Model| M[TensorFlow / Neural Engine]
+        D -->|2. Sub-ms Feature Lookup<br/>Protected by Circuit Breaker| R[(Redis Feature Store)]
+        D -->|3. In-Memory Thread-Safe Inference| M["TensorFlow Engine (@tf.function)"]
         D -->|4. Audit Persistence| PG
         D -->|5. Telemetry| Prom[/metrics: Latency & State Gauges/]
     end
 
     subgraph Resiliency ["Stateful Fault Tolerance"]
-        D -.->|Staleness > 60s| F1[Mode: DEGRADED_STALE<br/>Decision: MANUAL_REVIEW]
-        D -.->|Circuit OPEN (5 failures)| F2[Mode: INFRA_DEGRADED<br/>Decision: MANUAL_REVIEW]
-        D -.->|Duplicate txn_id| F3[Return Cached Decision<br/>idempotent_replay: true]
+        R -.->|Staleness > 60s| F1[Mode: DEGRADED_STALE<br/>Decision: MANUAL_REVIEW]
+        R -.->|Circuit OPEN (5 failures)| F2[Mode: INFRA_DEGRADED<br/>Decision: MANUAL_REVIEW]
+        PG -.->|Duplicate txn_id| F3[Return Cached Decision<br/>idempotent_replay: true]
     end
-```
+
+    M -->|Async ThreadPool Offload| D
+    D -->|JSON Response (256 req/sec)| Client
 
 ---
 
