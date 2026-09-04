@@ -7,19 +7,24 @@ A distributed streaming proof-of-concept demonstrating transaction fraud evaluat
 ## 1. System Topology
 
 ```mermaid
-fgraph TD
-    Client -->|HTTP Request| Gunicorn[Gunicorn / Gevent Workers]
-    Gunicorn -->|WSGI / Concurrency| Django[Django API View]
-    
-    subgraph Core Pipeline
-        Django -->|Feature Store Lookup| Redis[(Redis Cache)]
-        Django -->|Async ThreadPool| TF["TensorFlow Engine (@tf.function)"]
-        TF -->|Fast Inference (1.2ms)| Django
-    end
-    
-    Django -->|Asynchronous Audit Dispatch| PG[(PostgreSQL)]
-    Django -->|JSON Response (256 req/sec)| Client
+graph TD
+    Client[Client / JMeter] -->|POST /score| D[Django REST Framework]
 
+    subgraph Core Pipeline & Resiliency ["High-Performance Fraud Scoring Architecture"]
+        D -->|1. Idempotency Check| PG[(PostgreSQL / SQLite)]
+        D -->|2. Feature Lookup w/ Circuit Breaker| R[(Redis Feature Store)]
+        D -->|3. In-Memory Thread-Safe Inference| M["TensorFlow Engine (@tf.function)"]
+        
+        %% Resiliency Branches
+        R -.->|Staleness > 60s| F1[Mode: DEGRADED_STALE<br/>Decision: MANUAL_REVIEW]
+        R -.->|Circuit OPEN After Failures| F2[Mode: INFRA_DEGRADED<br/>Decision: MANUAL_REVIEW]
+        PG -.->|Duplicate txn_id| F3[Return Cached Decision<br/>idempotent_replay: true]
+    end
+
+    M -->|Async ThreadPool Offload| D
+    D -->|Asynchronous Audit Dispatch| PG
+    D -->|Prometheus Telemetry| Prom[/metrics/g]
+    D -->|JSON Response (256 req/sec)| Client
     subgraph Serving ["Inference & Scoring Service"]
         Client[Client / JMeter 500 Threads] -->|POST /score<br/>Rate-Limited: 1,200 req/s| D[Django REST Framework]
         D -->|1. Idempotency Check| PG[(PostgreSQL 15 / SQLite<br/>ScoredTransaction)]
